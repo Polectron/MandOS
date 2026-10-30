@@ -1,3 +1,0 @@
-void send_command() {
-
-};
