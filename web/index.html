@@ -1,0 +1,326 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MandOS Control</title>
+<style>
+  :root { color-scheme: light dark; --accent: #2563eb; --border: #8884; --muted: #888; }
+  body { font-family: system-ui, sans-serif; max-width: 760px; margin: 0 auto; padding: 1rem; }
+  header { display: flex; align-items: center; gap: .75rem; flex-wrap: wrap; }
+  h1 { font-size: 1.3rem; margin: 0; flex: 1; }
+  button { padding: .4rem .8rem; border: 1px solid var(--border); border-radius: 6px;
+           background: var(--accent); color: #fff; cursor: pointer; font: inherit; }
+  button.secondary { background: transparent; color: inherit; }
+  button:disabled { opacity: .5; cursor: default; }
+  input[type=text], input[type=number] { padding: .35rem; border: 1px solid var(--border);
+           border-radius: 6px; background: transparent; color: inherit; font: inherit; }
+  #status { color: var(--muted); font-size: .9rem; margin: .5rem 0 1rem; }
+  .device { border: 1px solid var(--border); border-radius: 10px; padding: .75rem 1rem; margin-bottom: 1rem; }
+  .device h2 { margin: 0; font-size: 1.1rem; }
+  .mac { color: var(--muted); font-size: .8rem; font-family: monospace; }
+  .feature { display: flex; align-items: center; gap: .5rem; flex-wrap: wrap;
+             padding: .5rem 0; border-top: 1px solid var(--border); margin-top: .5rem; }
+  .feature .name { font-weight: 600; min-width: 8rem; }
+  .feature .type { color: var(--muted); font-size: .8rem; }
+  .feature .value { font-family: monospace; margin-left: auto; }
+  .empty { color: var(--muted); }
+  #log { font-family: monospace; font-size: .8rem; color: var(--muted); max-height: 9rem;
+         overflow-y: auto; border-top: 1px solid var(--border); padding-top: .5rem; white-space: pre-wrap; }
+  .keys label { margin-right: .4rem; font-size: .85rem; }
+</style>
+</head>
+<body>
+<header>
+  <h1>MandOS Control</h1>
+  <button id="connect">Connect</button>
+  <button id="refresh" class="secondary" disabled>Refresh</button>
+</header>
+<div id="status">Not connected.</div>
+<div id="devices"><p class="empty">Connect to the core to see devices.</p></div>
+<div id="log"></div>
+
+<script>
+"use strict";
+
+// Must match src/core/ble_service.h
+const SERVICE_UUID = "4fafc201-1fb5-459e-8fcc-c5c9c331914b";
+const DEVICES_UUID = "beb5483e-36e1-4688-b7f5-ea07361b26a8";
+const WRITE_UUID   = "beb5483e-36e1-4688-b7f5-ea07361b26a9";
+const VALUE_UUID   = "beb5483e-36e1-4688-b7f5-ea07361b26aa";
+
+const MAX_VALUE = 64;
+const KEY_MODS = [["Ctrl", 0x01], ["Shift", 0x02], ["Alt", 0x04], ["Gui", 0x08]];
+const REFRESH_MS = 3000;
+
+const $ = (id) => document.getElementById(id);
+const encoder = new TextEncoder();
+const decoder = new TextDecoder();
+
+let server = null;
+let devicesChar = null, writeChar = null, valueChar = null;
+let lastDevicesJson = null;
+let refreshTimer = null;
+let busy = Promise.resolve(); // GATT operations must not overlap
+const lastValues = new Map(); // "MAC/index" -> display string
+
+function log(msg) {
+  const el = $("log");
+  el.textContent += `${new Date().toLocaleTimeString()}  ${msg}\n`;
+  el.scrollTop = el.scrollHeight;
+}
+
+function setStatus(msg) { $("status").textContent = msg; }
+
+function gatt(op) {
+  const run = busy.then(op);
+  busy = run.catch(() => {});
+  return run;
+}
+
+// ---------- encoding ----------
+
+function macToBytes(mac) {
+  return Uint8Array.from(mac.split(":").map((h) => parseInt(h, 16)));
+}
+
+function addressBytes(mac, index) {
+  const out = new Uint8Array(7);
+  out.set(macToBytes(mac), 0);
+  out[6] = index;
+  return out;
+}
+
+function concat(...parts) {
+  const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+  let off = 0;
+  for (const p of parts) { out.set(p, off); off += p.length; }
+  return out;
+}
+
+function encodeValue(type, ctl) {
+  switch (type) {
+    case "bool":
+      return Uint8Array.of(ctl.querySelector("input").checked ? 1 : 0);
+    case "int32": {
+      const v = Number(ctl.querySelector("input").value);
+      if (!Number.isInteger(v)) throw new Error("Enter a whole number");
+      const b = new DataView(new ArrayBuffer(4));
+      b.setInt32(0, v, true);
+      return new Uint8Array(b.buffer);
+    }
+    case "float": {
+      const v = Number(ctl.querySelector("input").value);
+      if (Number.isNaN(v)) throw new Error("Enter a number");
+      const b = new DataView(new ArrayBuffer(4));
+      b.setFloat32(0, v, true);
+      return new Uint8Array(b.buffer);
+    }
+    case "string": {
+      const bytes = encoder.encode(ctl.querySelector("input").value);
+      if (bytes.length > MAX_VALUE) throw new Error(`Max ${MAX_VALUE} bytes`);
+      return bytes;
+    }
+    case "keycombo": {
+      let mods = 0;
+      ctl.querySelectorAll("input[type=checkbox]").forEach((c) => { if (c.checked) mods |= Number(c.value); });
+      const keys = ctl.querySelector("input[type=text]").value
+        .split(/[\s,+]+/).filter(Boolean).map((k) => parseInt(k, 16));
+      if (keys.some((k) => Number.isNaN(k) || k < 0 || k > 255)) throw new Error("Keys are hex HID codes, e.g. 06");
+      return Uint8Array.of(mods, ...keys);
+    }
+  }
+  throw new Error(`Unsupported type ${type}`);
+}
+
+function formatValue(type, bytes) {
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  switch (type) {
+    case "bool": return bytes.length >= 1 ? String(bytes[0] !== 0) : "?";
+    case "int32": return bytes.length >= 4 ? String(view.getInt32(0, true)) : "?";
+    case "float": return bytes.length >= 4 ? String(Math.round(view.getFloat32(0, true) * 1e4) / 1e4) : "?";
+    case "string": return decoder.decode(bytes);
+    case "keycombo": {
+      if (bytes.length < 1) return "?";
+      const parts = KEY_MODS.filter(([, m]) => bytes[0] & m).map(([n]) => n);
+      for (const k of bytes.slice(1)) parts.push("0x" + k.toString(16).padStart(2, "0").toUpperCase());
+      return parts.join("+");
+    }
+  }
+  return "?";
+}
+
+// ---------- rendering ----------
+
+function el(tag, props = {}, ...children) {
+  const e = document.createElement(tag);
+  Object.assign(e, props);
+  e.append(...children);
+  return e;
+}
+
+function makeControl(type) {
+  const ctl = el("span", { className: "control" });
+  switch (type) {
+    case "bool": ctl.append(el("input", { type: "checkbox" })); break;
+    case "int32": ctl.append(el("input", { type: "number", step: "1", value: "0", size: 8 })); break;
+    case "float": ctl.append(el("input", { type: "number", step: "any", value: "0", size: 8 })); break;
+    case "string": ctl.append(el("input", { type: "text", maxLength: MAX_VALUE, placeholder: "text" })); break;
+    case "keycombo": {
+      ctl.classList.add("keys");
+      for (const [name, bit] of KEY_MODS) {
+        ctl.append(el("label", {}, el("input", { type: "checkbox", value: bit }), name));
+      }
+      ctl.append(el("input", { type: "text", size: 10, placeholder: "keys hex: 06" }));
+      break;
+    }
+  }
+  return ctl;
+}
+
+function renderFeature(device, index, feature) {
+  const key = `${device.id}/${index}`;
+  const valueEl = el("span", { className: "value", id: `val-${key}`, textContent: lastValues.get(key) ?? "" });
+  const row = el("div", { className: "feature" },
+    el("span", { className: "name" }, feature.name),
+    el("span", { className: "type" }, feature.type, " ", feature.flags));
+
+  if (feature.flags.includes("W")) {
+    const ctl = makeControl(feature.type);
+    const btn = el("button", { textContent: "Set" });
+    btn.onclick = () => writeFeature(device, index, feature, ctl);
+    row.append(ctl, btn);
+  }
+  if (feature.flags.includes("R")) {
+    const btn = el("button", { className: "secondary", textContent: "Read" });
+    btn.onclick = () => readFeature(device, index);
+    row.append(btn);
+  }
+  row.append(valueEl);
+  return row;
+}
+
+function renderDevices(devices) {
+  const root = $("devices");
+  root.replaceChildren();
+  if (devices.length === 0) {
+    root.append(el("p", { className: "empty" }, "No devices registered yet. Waiting for announcements…"));
+    return;
+  }
+  for (const d of devices) {
+    const card = el("div", { className: "device" },
+      el("h2", {}, d.name || "(unnamed)"),
+      el("div", { className: "mac" }, d.id));
+    d.features.forEach((f, i) => card.append(renderFeature(d, i, f)));
+    root.append(card);
+  }
+}
+
+// ---------- BLE ----------
+
+async function refreshDevices(force = false) {
+  if (!devicesChar) return;
+  try {
+    const dv = await gatt(() => devicesChar.readValue());
+    const json = decoder.decode(dv);
+    if (!force && json === lastDevicesJson) return;
+    lastDevicesJson = json;
+    const devices = JSON.parse(json);
+    window.currentDevices = devices;
+    renderDevices(devices);
+  } catch (e) {
+    log(`Refresh failed: ${e.message}`);
+  }
+}
+
+function findFeature(mac, index) {
+  const d = (window.currentDevices || []).find((x) => x.id === mac);
+  return d && d.features[index] ? { device: d, feature: d.features[index] } : null;
+}
+
+function onValue(event) {
+  const dv = event.target.value;
+  const bytes = new Uint8Array(dv.buffer, dv.byteOffset, dv.byteLength);
+  if (bytes.length < 7) return;
+  const mac = Array.from(bytes.slice(0, 6), (b) => b.toString(16).padStart(2, "0").toUpperCase()).join(":");
+  const index = bytes[6];
+  const found = findFeature(mac, index);
+  if (!found) return;
+  const text = formatValue(found.feature.type, bytes.slice(7));
+  lastValues.set(`${mac}/${index}`, text);
+  const span = document.getElementById(`val-${mac}/${index}`);
+  if (span) span.textContent = text;
+  log(`${found.device.name}/${found.feature.name} = ${text}`);
+}
+
+async function writeFeature(device, index, feature, ctl) {
+  try {
+    const value = encodeValue(feature.type, ctl);
+    const payload = concat(addressBytes(device.id, index), value);
+    await gatt(() => writeChar.writeValueWithResponse(payload));
+    log(`Wrote ${device.name}/${feature.name}`);
+  } catch (e) {
+    log(`Write failed: ${e.message}`);
+  }
+}
+
+async function readFeature(device, index) {
+  try {
+    await gatt(() => valueChar.writeValueWithResponse(addressBytes(device.id, index)));
+  } catch (e) {
+    log(`Read request failed: ${e.message}`);
+  }
+}
+
+function onDisconnected() {
+  clearInterval(refreshTimer);
+  devicesChar = writeChar = valueChar = null;
+  lastDevicesJson = null;
+  $("refresh").disabled = true;
+  $("connect").textContent = "Connect";
+  setStatus("Disconnected.");
+  $("devices").replaceChildren(el("p", { className: "empty" }, "Connect to the core to see devices."));
+  log("Disconnected");
+}
+
+async function connect() {
+  if (!navigator.bluetooth) {
+    setStatus("Web Bluetooth is not available. Use Chrome/Edge over https or localhost.");
+    return;
+  }
+  try {
+    const device = await navigator.bluetooth.requestDevice({
+      filters: [{ services: [SERVICE_UUID] }],
+    });
+    device.addEventListener("gattserverdisconnected", onDisconnected);
+    setStatus(`Connecting to ${device.name || "core"}…`);
+
+    server = await device.gatt.connect();
+    const service = await server.getPrimaryService(SERVICE_UUID);
+    devicesChar = await service.getCharacteristic(DEVICES_UUID);
+    writeChar = await service.getCharacteristic(WRITE_UUID);
+    valueChar = await service.getCharacteristic(VALUE_UUID);
+
+    valueChar.addEventListener("characteristicvaluechanged", onValue);
+    await valueChar.startNotifications();
+
+    setStatus(`Connected to ${device.name || "core"}.`);
+    $("connect").textContent = "Disconnect";
+    $("refresh").disabled = false;
+    log("Connected");
+
+    await refreshDevices(true);
+    refreshTimer = setInterval(() => refreshDevices(), REFRESH_MS);
+  } catch (e) {
+    setStatus(`Connection failed: ${e.message}`);
+  }
+}
+
+$("connect").onclick = () => {
+  if (server && server.connected) server.disconnect();
+  else connect();
+};
+$("refresh").onclick = () => refreshDevices(true);
+</script>
+</body>
+</html>
