@@ -13,6 +13,20 @@ bool validFeatureType(uint8_t t) {
     return t >= (uint8_t)FeatureType::Bool && t <= (uint8_t)FeatureType::KeyCombo;
 }
 
+bool sameContent(const Device &a, const Device &b) {
+    if (a.name != b.name || a.capabilities.size() != b.capabilities.size()) {
+        return false;
+    }
+    for (size_t i = 0; i < a.capabilities.size(); i++) {
+        const DeviceCapability &x = a.capabilities[i], &y = b.capabilities[i];
+        if (x.name != y.name || x.type != y.type || x.can_read != y.can_read ||
+            x.can_write != y.can_write || x.can_notify != y.can_notify) {
+            return false;
+        }
+    }
+    return true;
+}
+
 std::string jsonEscape(const std::string &in) {
     std::string out;
     for (unsigned char c : in) {
@@ -77,6 +91,14 @@ std::string DeviceRegistry::macToString(const uint8_t mac[6]) {
 }
 
 bool DeviceRegistry::update(const uint8_t mac[6], const AnnounceMessage &msg, unsigned long nowMs) {
+    return upsert(mac, msg, nowMs, true);
+}
+
+bool DeviceRegistry::restore(const uint8_t mac[6], const AnnounceMessage &msg) {
+    return upsert(mac, msg, 0, false);
+}
+
+bool DeviceRegistry::upsert(const uint8_t mac[6], const AnnounceMessage &msg, unsigned long nowMs, bool online) {
     if (msg.feature_count > MANDOS_MAX_FEATURES) {
         return false;
     }
@@ -86,6 +108,7 @@ bool DeviceRegistry::update(const uint8_t mac[6], const AnnounceMessage &msg, un
     memcpy(device.mac_raw.data(), mac, 6);
     device.name = boundedString(msg.name, sizeof(msg.name));
     device.last_seen_ms = nowMs;
+    device.online = online;
     for (uint8_t i = 0; i < msg.feature_count; i++) {
         const FeatureInfo &f = msg.features[i];
         if (!validFeatureType(f.type)) {
@@ -101,8 +124,75 @@ bool DeviceRegistry::update(const uint8_t mac[6], const AnnounceMessage &msg, un
     }
 
     std::lock_guard<std::mutex> lock(mutex_);
+    auto it = devices_.find(device.mac);
+    if (it == devices_.end() || !sameContent(it->second, device)) {
+        dirty_ = dirty_ || online;
+    }
     devices_[device.mac] = std::move(device);
     return true;
+}
+
+void DeviceRegistry::markSeen(const uint8_t mac[6], unsigned long nowMs) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = devices_.find(macToString(mac));
+    if (it != devices_.end()) {
+        it->second.online = true;
+        it->second.last_seen_ms = nowMs;
+    }
+}
+
+void DeviceRegistry::setReachable(const uint8_t mac[6], bool reachable, unsigned long nowMs) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = devices_.find(macToString(mac));
+    if (it == devices_.end()) {
+        return;
+    }
+    it->second.online = reachable;
+    if (reachable) {
+        it->second.last_seen_ms = nowMs;
+    }
+}
+
+std::vector<std::array<uint8_t, 6>> DeviceRegistry::offlineMacs() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::vector<std::array<uint8_t, 6>> out;
+    for (const auto &entry : devices_) {
+        if (!entry.second.online) {
+            out.push_back(entry.second.mac_raw);
+        }
+    }
+    return out;
+}
+
+bool DeviceRegistry::takeDirty() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    bool d = dirty_;
+    dirty_ = false;
+    return d;
+}
+
+std::vector<StoredDevice> DeviceRegistry::exportAll() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::vector<StoredDevice> out;
+    for (const auto &entry : devices_) {
+        const Device &d = entry.second;
+        StoredDevice s;
+        s.mac = d.mac_raw;
+        memset(&s.announce, 0, sizeof(s.announce));
+        s.announce.header = makeHeader(MsgType::Announce);
+        strncpy(s.announce.name, d.name.c_str(), sizeof(s.announce.name) - 1);
+        s.announce.feature_count = d.capabilities.size();
+        for (size_t i = 0; i < d.capabilities.size(); i++) {
+            const DeviceCapability &c = d.capabilities[i];
+            FeatureInfo &f = s.announce.features[i];
+            strncpy(f.name, c.name.c_str(), sizeof(f.name) - 1);
+            f.type = static_cast<uint8_t>(c.type);
+            f.flags = (c.can_read ? FEATURE_READ : 0) | (c.can_write ? FEATURE_WRITE : 0) |
+                      (c.can_notify ? FEATURE_NOTIFY : 0);
+        }
+        out.push_back(s);
+    }
+    return out;
 }
 
 std::string DeviceRegistry::describeValue(const uint8_t mac[6], const ValueMessage &msg) {
@@ -166,8 +256,8 @@ std::string DeviceRegistry::dump() {
     std::string out = buf;
     for (const auto &entry : devices_) {
         const Device &d = entry.second;
-        snprintf(buf, sizeof(buf), "%s  name=%s  last_seen=%lums\n",
-                 d.mac.c_str(), d.name.c_str(), d.last_seen_ms);
+        snprintf(buf, sizeof(buf), "%s  name=%s  %s  last_seen=%lums\n",
+                 d.mac.c_str(), d.name.c_str(), d.online ? "online" : "offline", d.last_seen_ms);
         out += buf;
         for (const auto &c : d.capabilities) {
             snprintf(buf, sizeof(buf), "    - %s (%s) %s%s%s\n", c.name.c_str(),
@@ -187,7 +277,8 @@ std::string DeviceRegistry::toJson() {
         const Device &d = entry.second;
         if (!firstDev) out += ",";
         firstDev = false;
-        out += "{\"id\":\"" + d.mac + "\",\"name\":\"" + jsonEscape(d.name) + "\",\"features\":[";
+        out += "{\"id\":\"" + d.mac + "\",\"name\":\"" + jsonEscape(d.name) + "\",\"online\":" +
+               (d.online ? "true" : "false") + ",\"features\":[";
         bool firstFeat = true;
         for (const auto &c : d.capabilities) {
             if (!firstFeat) out += ",";

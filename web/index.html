@@ -18,6 +18,11 @@
   #status { color: var(--muted); font-size: .9rem; margin: .5rem 0 1rem; }
   .device { border: 1px solid var(--border); border-radius: 10px; padding: .75rem 1rem; margin-bottom: 1rem; }
   .device h2 { margin: 0; font-size: 1.1rem; }
+  .device.offline { opacity: .6; }
+  .badge { font-size: .75rem; font-weight: 600; padding: .1rem .5rem; border-radius: 999px;
+           border: 1px solid currentColor; vertical-align: middle; margin-left: .5rem; }
+  .badge.online { color: #16a34a; }
+  .badge.offline { color: #dc2626; }
   .mac { color: var(--muted); font-size: .8rem; font-family: monospace; }
   .feature { display: flex; align-items: center; gap: .5rem; flex-wrap: wrap;
              padding: .5rem 0; border-top: 1px solid var(--border); margin-top: .5rem; }
@@ -204,12 +209,13 @@ function renderDevices(devices) {
   const root = $("devices");
   root.replaceChildren();
   if (devices.length === 0) {
-    root.append(el("p", { className: "empty" }, "No devices registered yet. Waiting for announcements…"));
+    root.append(el("p", { className: "empty" }, "No devices registered yet. Waiting for a device to announce itself on boot…"));
     return;
   }
   for (const d of devices) {
-    const card = el("div", { className: "device" },
-      el("h2", {}, d.name || "(unnamed)"),
+    const card = el("div", { className: d.online ? "device" : "device offline" },
+      el("h2", {}, d.name || "(unnamed)",
+        el("span", { className: d.online ? "badge online" : "badge offline" }, d.online ? "online" : "offline")),
       el("div", { className: "mac" }, d.id));
     d.features.forEach((f, i) => card.append(renderFeature(d, i, f)));
     root.append(card);

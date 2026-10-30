@@ -46,15 +46,7 @@ bool MandosDevice::begin() {
     return true;
 }
 
-void MandosDevice::loop() {
-    if (started_ && millis() - lastAnnounce_ >= announceIntervalMs_) {
-        announce();
-    }
-}
-
 void MandosDevice::announce() {
-    lastAnnounce_ = millis();
-
     AnnounceMessage msg;
     memset(&msg, 0, sizeof(msg));
     msg.header = makeHeader(MsgType::Announce);
@@ -70,7 +62,7 @@ void MandosDevice::announce() {
 }
 
 // Notifications are broadcast: the device does not need to know the core's MAC.
-bool MandosDevice::sendValue(uint8_t index, const uint8_t *data, size_t len) {
+bool MandosDevice::sendValue(uint8_t index, const uint8_t *data, size_t len, uint16_t commandId) {
     if (!started_ || len > MANDOS_MAX_VALUE) {
         return false;
     }
@@ -78,6 +70,7 @@ bool MandosDevice::sendValue(uint8_t index, const uint8_t *data, size_t len) {
     ValueMessage msg;
     memset(&msg, 0, sizeof(msg));
     msg.header = makeHeader(MsgType::Notify);
+    msg.command_id = commandId;
     msg.feature_index = index;
     msg.length = len;
     memcpy(msg.data, data, len);
@@ -97,7 +90,9 @@ void MandosDevice::handle(const uint8_t *data, int len) {
         return;
     }
 
-    if (type == MsgType::Read && len == (int)sizeof(ReadMessage)) {
+    if (type == MsgType::Ping && len == (int)sizeof(PingMessage)) {
+        announce();
+    } else if (type == MsgType::Read && len == (int)sizeof(ReadMessage)) {
         ReadMessage msg;
         memcpy(&msg, data, sizeof(msg));
         if (msg.feature_index >= featureCount_ || !(features_[msg.feature_index]->flags() & FEATURE_READ)) {
@@ -105,7 +100,7 @@ void MandosDevice::handle(const uint8_t *data, int len) {
         }
         uint8_t buf[MANDOS_MAX_VALUE];
         size_t n = features_[msg.feature_index]->onRead(buf, sizeof(buf));
-        sendValue(msg.feature_index, buf, n);
+        sendValue(msg.feature_index, buf, n, msg.command_id);
     } else if (type == MsgType::Write && len >= (int)valueMessageSize(0)) {
         ValueMessage msg;
         memset(&msg, 0, sizeof(msg));

@@ -47,7 +47,6 @@ void setup() {
 }
 
 void loop() {
-    dev.loop();
 
     static unsigned long lastToggle = 0;
     static bool on = false;

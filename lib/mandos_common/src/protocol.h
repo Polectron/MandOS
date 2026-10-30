@@ -6,7 +6,7 @@
 // Wire format shared by every MandOS firmware (core and all devices).
 // ESP-NOW payloads are limited to 250 bytes. All messages start with a Header.
 
-constexpr uint8_t MANDOS_PROTOCOL_VERSION = 2;
+constexpr uint8_t MANDOS_PROTOCOL_VERSION = 3;
 constexpr size_t MANDOS_NAME_LEN = 16;
 constexpr size_t MANDOS_MAX_FEATURES = 12;
 constexpr size_t MANDOS_MAX_VALUE = 64;
@@ -16,6 +16,7 @@ enum class MsgType : uint8_t {
     Read = 2,      // core -> device: request the current value of a feature
     Write = 3,     // core -> device: set a feature value
     Notify = 4,    // device -> core: a feature value changed / read response
+    Ping = 5,      // core -> device: liveness check, the device answers with an Announce
 };
 
 // Value encodings (little endian):
@@ -60,14 +61,24 @@ struct __attribute__((packed)) AnnounceMessage {
 };
 
 // Features are addressed by their index in the announced list.
+// Commands (Read, Write, Ping) carry a `command_id` chosen by the core, never 0. A Notify sent
+// in response to a Read echoes that id; spontaneous Notify messages use 0.
+// Delivery is not acked by the firmware: the core relies on the ESP-NOW send callback.
 struct __attribute__((packed)) ReadMessage {
     Header header;
+    uint16_t command_id;
     uint8_t feature_index;
+};
+
+struct __attribute__((packed)) PingMessage {
+    Header header;
+    uint16_t command_id;
 };
 
 // Used for both Write and Notify.
 struct __attribute__((packed)) ValueMessage {
     Header header;
+    uint16_t command_id;  // Write: set by the core. Notify: id of the Read it answers, else 0
     uint8_t feature_index;
     uint8_t length;
     uint8_t data[MANDOS_MAX_VALUE];

@@ -10,7 +10,8 @@
 // Service MANDOS_BLE_SERVICE_UUID:
 //
 //   devices (READ)
-//       JSON list of registered devices, see DeviceRegistry::toJson().
+//       JSON list of registered devices (including their online state), see
+//       DeviceRegistry::toJson(). The list is persisted in flash by the core.
 //       Long reads are supported, so the list may exceed the MTU.
 //
 //   write (WRITE)

@@ -21,6 +21,8 @@ class Device {
     std::string mac;
     std::array<uint8_t, 6> mac_raw{};
     unsigned long last_seen_ms = 0;
+    // False for devices restored from storage until a command to them is delivered or they send a message.
+    bool online = false;
     // Position in the vector is the feature index used on the wire.
     std::vector<DeviceCapability> capabilities;
 };

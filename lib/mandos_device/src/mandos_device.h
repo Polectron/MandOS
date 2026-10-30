@@ -4,7 +4,7 @@
 
 #include "feature.h"
 
-// Device runtime: owns ESP-NOW setup, periodic announcements and dispatching
+// Device runtime: owns ESP-NOW setup, the boot announcement and dispatching
 // of core requests to registered features. Device firmwares only declare
 // their name and features.
 class MandosDevice {
@@ -15,12 +15,9 @@ public:
     bool addFeature(Feature &feature);
 
     bool begin();
-    // Call from loop(): sends the periodic announcement.
-    void loop();
 
-    bool sendValue(uint8_t index, const uint8_t *data, size_t len);
-
-    void setAnnounceIntervalMs(unsigned long ms) { announceIntervalMs_ = ms; }
+    // `commandId` is the id of the Read being answered, 0 for spontaneous notifications.
+    bool sendValue(uint8_t index, const uint8_t *data, size_t len, uint16_t commandId = 0);
 
 private:
     static void onRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len);
@@ -30,8 +27,6 @@ private:
     const char *name_;
     Feature *features_[MANDOS_MAX_FEATURES] = {};
     uint8_t featureCount_ = 0;
-    unsigned long announceIntervalMs_ = 1000;
-    unsigned long lastAnnounce_ = 0;
     bool started_ = false;
 
     static MandosDevice *instance_;
